@@ -4,9 +4,9 @@ Automated gamma-spectrum acquisition with ORTEC MAESTRO + weather logging.
 What it does
 ------------
 1. Builds a MAESTRO .JOB file that, N times in a row:
-       CLEAR -> START -> WAIT (preset real time) -> SAVE "spec_###.Chn"
+       CLEAR -> START -> WAIT (preset real time) -> SAVE "spec_###.Spe"
 2. Launches MAESTRO with that job file (or you run the job yourself).
-3. Watches the output folder. Each time a new .Chn spectrum appears it
+3. Watches the output folder. Each time a new .Spe spectrum appears it
    reads the header (start time, real/live time, total counts), fetches
    current weather (Open-Meteo, free, no API key), and appends a row to
    run_log.csv.
@@ -30,7 +30,6 @@ import datetime as dt
 import glob
 import json
 import os
-import struct
 import subprocess
 import sys
 import time
@@ -90,34 +89,43 @@ def get_weather():
     return out
 
 
-# ---------------------------------------------------------------- .Chn file
-def read_chn(path):
-    """Parse an ORTEC .Chn header. Returns dict (start time, real/live s, counts)."""
-    with open(path, "rb") as f:
-        data = f.read()
-    (ftype, mca, seg, secs, real20, live20,
-     date, hhmm, offset, nch) = struct.unpack("<hhh2sii8s4shh", data[:32])
-    if ftype != -1:
-        raise ValueError("not a .Chn file")
-    counts = struct.unpack(f"<{nch}i", data[32:32 + 4 * nch])
-    # date like b'18NOV261' (last char '1' => 2000s), time b'1405', secs b'07'
-    d = date.decode("ascii", "replace")
-    try:
-        year = (2000 if d[7] == "1" else 1900) + int(d[5:7])
-        start = dt.datetime.strptime(
-            f"{d[0:2]}{d[2:5].title()}{year} {hhmm.decode()}{secs.decode()}",
-            "%d%b%Y %H%M%S")
-        start_s = start.isoformat(sep=" ")
-    except Exception:
-        start_s = ""
+# ---------------------------------------------------------------- .Spe file
+def read_spe(path):
+    """Parse an ORTEC ASCII .Spe file. Returns dict (start time, real/live s, counts)."""
+    with open(path, "r", errors="replace") as f:
+        lines = [ln.strip() for ln in f]
+    sections, key = {}, None
+    for ln in lines:
+        if ln.startswith("$"):
+            key = ln.rstrip(":")
+            sections[key] = []
+        elif key:
+            sections[key].append(ln)
+    if "$DATA" not in sections:
+        raise ValueError("no $DATA section (file incomplete?)")
+    first, last = (int(x) for x in sections["$DATA"][0].split()[:2])
+    nch = last - first + 1
+    counts = [int(float(x)) for x in sections["$DATA"][1:1 + nch] if x]
+    if len(counts) != nch:
+        raise ValueError("spectrum incomplete")
+    live, real = (float(x) for x in sections.get("$MEAS_TIM", ["0 0"])[0].split()[:2])
+    start_s = ""
+    date = (sections.get("$DATE_MEA") or [""])[0]
+    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            start_s = dt.datetime.strptime(date, fmt).isoformat(sep=" ")
+            break
+        except ValueError:
+            pass
+    total = sum(counts)
     return {
         "acq_start": start_s,
-        "real_time_s": real20 * 0.02,
-        "live_time_s": live20 * 0.02,
-        "dead_time_pct": round(100 * (1 - live20 / real20), 3) if real20 else "",
+        "real_time_s": real,
+        "live_time_s": live,
+        "dead_time_pct": round(100 * (1 - live / real), 3) if real else "",
         "channels": nch,
-        "total_counts": sum(counts),
-        "count_rate_cps": round(sum(counts) / (live20 * 0.02), 4) if live20 else "",
+        "total_counts": total,
+        "count_rate_cps": round(total / live, 4) if live else "",
     }
 
 
@@ -131,7 +139,7 @@ def write_job(path, run_dir, n, acq_s, interval_s, detector):
         "  CLEAR",
         "  START",
         "  WAIT",
-        f'  SAVE "{os.path.join(run_dir, "spec_???.Chn")}"',
+        f'  SAVE "{os.path.join(run_dir, "spec_???.Spe")}"',
     ]
     if interval_s > acq_s:  # idle time between spectra
         lines.append(f"  WAIT {interval_s - acq_s}")
@@ -224,7 +232,7 @@ def main():
     print("Waiting for spectra... (Ctrl+C to stop watching)\n")
     try:
         while len(seen) < n:
-            for path in sorted(glob.glob(os.path.join(run_dir, "*.Chn"))):
+            for path in sorted(glob.glob(os.path.join(run_dir, "*.Spe"))):
                 if path in seen:
                     continue
                 size = os.path.getsize(path)
@@ -232,7 +240,7 @@ def main():
                     pending[path] = size
                     continue
                 try:
-                    info = read_chn(path)
+                    info = read_spe(path)
                 except Exception:
                     continue                    # still being written
                 seen.add(path)
@@ -247,7 +255,7 @@ def main():
                       f"({len(seen)}/{n})")
             if proc and proc.poll() is not None and len(seen) < n:
                 time.sleep(3)  # last file may still be landing
-                if not any(pth not in seen for pth in glob.glob(os.path.join(run_dir, "*.Chn"))):
+                if not any(pth not in seen for pth in glob.glob(os.path.join(run_dir, "*.Spe"))):
                     print("MAESTRO closed before the run finished.")
                     break
             time.sleep(2)

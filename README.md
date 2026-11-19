@@ -49,8 +49,8 @@ Each run creates its own folder:
 ```
 data/run_YYYYMMDD_HHMMSS/
 ├── acquire.JOB      # the MAESTRO job file that was run
-├── spec_001.Chn     # spectra (ORTEC .Chn format, opens in MAESTRO)
-├── spec_002.Chn
+├── spec_001.Spe     # spectra (ORTEC ASCII .Spe format, opens in MAESTRO or any text editor)
+├── spec_002.Spe
 ├── ...
 ├── run_log.csv      # one row per spectrum
 └── run_info.json    # run settings and weather at the start of the run
@@ -62,7 +62,7 @@ data/run_YYYYMMDD_HHMMSS/
 |---|---|
 | `index`, `file` | Spectrum number and file name |
 | `saved_at` | Computer time when the spectrum was detected as saved |
-| `acq_start` | Acquisition start time, read from the .Chn header |
+| `acq_start` | Acquisition start time, read from the .Spe file |
 | `real_time_s`, `live_time_s`, `dead_time_pct` | Timing from the MCA |
 | `channels`, `total_counts`, `count_rate_cps` | Spectrum summary (the rate is total counts divided by live time) |
 | `temperature_2m` | Air temperature (°C) |
@@ -79,9 +79,9 @@ data/run_YYYYMMDD_HHMMSS/
 
 MAESTRO has no live control interface from Python, so the script uses MAESTRO's built-in job files:
 
-1. It writes `acquire.JOB`, which loops `CLEAR → START → WAIT → SAVE spec_???.Chn` N times, using a preset real time.
+1. It writes `acquire.JOB`, which loops `CLEAR → START → WAIT → SAVE spec_???.Spe` N times, using a preset real time.
 2. It starts MAESTRO with that job file.
-3. It checks the run folder every 2 seconds. When a new `.Chn` file appears and has finished writing, the script reads the header and fetches the current weather from [Open-Meteo](https://open-meteo.com/) (free, no API key). Then it adds a row to `run_log.csv`.
+3. It checks the run folder every 2 seconds. When a new `.Spe` file appears and has finished writing, the script reads it and fetches the current weather from [Open-Meteo](https://open-meteo.com/) (free, no API key). Then it adds a row to `run_log.csv`.
 
 Weather is fetched for Urbana-Champaign, IL. For a different location, edit `LATITUDE` and `LONGITUDE` near the top of `controller.py`.
 

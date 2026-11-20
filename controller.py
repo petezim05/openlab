@@ -130,10 +130,10 @@ def read_spe(path):
 
 
 # ---------------------------------------------------------------- job file
-def write_job(path, run_dir, n, acq_s, interval_s, detector):
+def write_job(path, run_dir, n, acq_s, interval_s, detector, quit_at_end=False):
     lines = [
         f"SET_DETECTOR {detector}",
-        "SET_PRESET_CLEAR",
+        # (no SET_PRESET_CLEAR: some MCBs reject it -> "failure in detector function")
         f"SET_PRESET_REAL {acq_s}",
         f"LOOP {n}",
         "  CLEAR",
@@ -144,6 +144,8 @@ def write_job(path, run_dir, n, acq_s, interval_s, detector):
     if interval_s > acq_s:  # idle time between spectra
         lines.append(f"  WAIT {interval_s - acq_s}")
     lines.append("END_LOOP")
+    if quit_at_end:  # close MAESTRO so the next day's job can be launched
+        lines.append("QUIT")
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -156,6 +158,55 @@ def find_maestro(user_path):
         if hits:
             return hits[0]
     return None
+
+
+FIELDS = (["index", "file", "saved_at", "acq_start", "real_time_s", "live_time_s",
+           "dead_time_pct", "channels", "total_counts", "count_rate_cps"]
+          + WEATHER_FIELDS + ["weather_obs_time", "weather_error"])
+
+
+def new_day_dir():
+    """data/YYYY-MM-DD for today (adds _2, _3... if that folder already has spectra)."""
+    base = os.path.join(DATA_ROOT, dt.date.today().isoformat())
+    d, k = base, 2
+    while glob.glob(os.path.join(d, "*.Spe")):
+        d, k = f"{base}_{k}", k + 1
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def watch(day_dir, n, proc, log_path):
+    """Log each new spectrum in day_dir until n are seen. Returns number seen."""
+    seen, pending = set(), {}
+    while len(seen) < n:
+        for path in sorted(glob.glob(os.path.join(day_dir, "*.Spe"))):
+            if path in seen:
+                continue
+            size = os.path.getsize(path)
+            if pending.get(path) != size:   # wait until size is stable
+                pending[path] = size
+                continue
+            try:
+                info = read_spe(path)
+            except Exception:
+                continue                    # still being written
+            seen.add(path)
+            row = {"index": len(seen), "file": os.path.basename(path),
+                   "saved_at": dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
+                   **info, **get_weather()}
+            with open(log_path, "a", newline="") as f:
+                csv.DictWriter(f, fieldnames=FIELDS).writerow(row)
+            print(f"[{row['saved_at']}] {row['file']}  {info['total_counts']} counts  "
+                  f"{info['count_rate_cps']} cps  T={row['temperature_2m']}C  "
+                  f"P={row['surface_pressure']}hPa  RH={row['relative_humidity_2m']}%  "
+                  f"({len(seen)}/{n})")
+        if proc and proc.poll() is not None and len(seen) < n:
+            time.sleep(3)  # last file may still be landing
+            if not any(pth not in seen for pth in glob.glob(os.path.join(day_dir, "*.Spe"))):
+                print("MAESTRO closed before the day's job finished.")
+                break
+        time.sleep(2)
+    return len(seen)
 
 
 # ---------------------------------------------------------------- main
@@ -188,81 +239,72 @@ def main():
         n = max(1, int(total_s // interval))
     else:
         p.error("give --hours, --minutes, or --count")
-    if n > 999:
-        p.error("max 999 spectra per run (MAESTRO ??? numbering); split into several runs")
+    per_day = 86400 // interval            # 288 with 5-minute spectra
+    if per_day > 999:
+        p.error("max 999 spectra per day folder (MAESTRO ??? numbering); use a longer --interval")
+    n_days = -(-n // per_day)
 
-    run_dir = os.path.join(DATA_ROOT, dt.datetime.now().strftime("run_%Y%m%d_%H%M%S"))
-    os.makedirs(run_dir, exist_ok=True)
-    job_path = os.path.join(run_dir, "acquire.JOB")
-    log_path = os.path.join(run_dir, "run_log.csv")
-    write_job(job_path, run_dir, n, a.acq, interval, a.detector)
-
-    end_eta = dt.datetime.now() + dt.timedelta(seconds=n * interval)
-    print(f"Run folder : {run_dir}")
-    print(f"Plan       : {n} spectra x {a.acq} s, one every {interval} s")
-    print(f"Expected end ~ {end_eta:%Y-%m-%d %H:%M}")
-
-    # Log conditions at the start of the run
-    fields = (["index", "file", "saved_at", "acq_start", "real_time_s", "live_time_s",
-               "dead_time_pct", "channels", "total_counts", "count_rate_cps"]
-              + WEATHER_FIELDS + ["weather_obs_time", "weather_error"])
-    with open(log_path, "w", newline="") as f:
-        csv.DictWriter(f, fieldnames=fields).writeheader()
-    w0 = get_weather()
-    with open(os.path.join(run_dir, "run_info.json"), "w") as f:
-        json.dump({"started": dt.datetime.now().isoformat(), "n_spectra": n,
-                   "acq_s": a.acq, "interval_s": interval, "detector": a.detector,
-                   "lat": LATITUDE, "lon": LONGITUDE, "weather_at_start": w0}, f, indent=2)
-    if w0["weather_error"]:
-        print(f"WARNING: weather fetch failed ({w0['weather_error']}). "
-              "Spectra will still be saved; weather columns will be blank.")
-
-    proc = None
-    if a.no_launch:
-        print(f"\nIn MAESTRO: Services > Job Control... and run:\n  {job_path}\n")
-    else:
+    exe = None
+    if not a.no_launch:
         exe = find_maestro(a.maestro)
         if not exe:
             sys.exit("Could not find MAESTRO (MCA32.exe). Use --maestro PATH or --no-launch.")
-        print(f"Launching  : {exe}")
-        proc = subprocess.Popen([exe, job_path])
 
-    # Watch for new spectra
-    seen, pending = set(), {}
-    print("Waiting for spectra... (Ctrl+C to stop watching)\n")
+    end_eta = dt.datetime.now() + dt.timedelta(seconds=n * interval)
+    print(f"Data folder: {DATA_ROOT}")
+    print(f"Plan       : {n} spectra x {a.acq} s, one every {interval} s "
+          f"-> {n_days} day folder(s) of up to {per_day}")
+    print(f"Expected end ~ {end_eta:%Y-%m-%d %H:%M}")
+
+    total = 0
     try:
-        while len(seen) < n:
-            for path in sorted(glob.glob(os.path.join(run_dir, "*.Spe"))):
-                if path in seen:
-                    continue
-                size = os.path.getsize(path)
-                if pending.get(path) != size:   # wait until size is stable
-                    pending[path] = size
-                    continue
+        for day in range(n_days):
+            day_n = min(per_day, n - day * per_day)
+            last = day == n_days - 1
+            run_dir = new_day_dir()
+            job_path = os.path.join(run_dir, "acquire.JOB")
+            log_path = os.path.join(run_dir, "run_log.csv")
+            write_job(job_path, run_dir, day_n, a.acq, interval, a.detector,
+                      quit_at_end=not last and not a.no_launch)
+
+            # Log conditions at the start of the day
+            with open(log_path, "w", newline="") as f:
+                csv.DictWriter(f, fieldnames=FIELDS).writeheader()
+            w0 = get_weather()
+            with open(os.path.join(run_dir, "run_info.json"), "w") as f:
+                json.dump({"started": dt.datetime.now().isoformat(), "day": day + 1,
+                           "n_days": n_days, "n_spectra": day_n,
+                           "acq_s": a.acq, "interval_s": interval, "detector": a.detector,
+                           "lat": LATITUDE, "lon": LONGITUDE, "weather_at_start": w0}, f, indent=2)
+            print(f"\n=== Day {day + 1}/{n_days}: {day_n} spectra -> {run_dir}")
+            if w0["weather_error"]:
+                print(f"WARNING: weather fetch failed ({w0['weather_error']}). "
+                      "Spectra will still be saved; weather columns will be blank.")
+
+            proc = None
+            if a.no_launch:
+                print(f"In MAESTRO: Services > Job Control... and run:\n  {job_path}")
+            else:
+                print(f"Launching  : {exe}")
+                proc = subprocess.Popen([exe, job_path])
+            print("Waiting for spectra... (Ctrl+C to stop watching)\n")
+
+            got = watch(run_dir, day_n, proc, log_path)
+            total += got
+            if got < day_n:
+                print("Day incomplete; stopping.")
+                break
+            if proc and not last:            # let MAESTRO QUIT before relaunching
                 try:
-                    info = read_spe(path)
-                except Exception:
-                    continue                    # still being written
-                seen.add(path)
-                row = {"index": len(seen), "file": os.path.basename(path),
-                       "saved_at": dt.datetime.now().isoformat(sep=" ", timespec="seconds"),
-                       **info, **get_weather()}
-                with open(log_path, "a", newline="") as f:
-                    csv.DictWriter(f, fieldnames=fields).writerow(row)
-                print(f"[{row['saved_at']}] {row['file']}  {info['total_counts']} counts  "
-                      f"{info['count_rate_cps']} cps  T={row['temperature_2m']}C  "
-                      f"P={row['surface_pressure']}hPa  RH={row['relative_humidity_2m']}%  "
-                      f"({len(seen)}/{n})")
-            if proc and proc.poll() is not None and len(seen) < n:
-                time.sleep(3)  # last file may still be landing
-                if not any(pth not in seen for pth in glob.glob(os.path.join(run_dir, "*.Spe"))):
-                    print("MAESTRO closed before the run finished.")
-                    break
-            time.sleep(2)
+                    proc.wait(timeout=120)
+                except subprocess.TimeoutExpired:
+                    print("MAESTRO did not close by itself; closing it.")
+                    proc.terminate()
+                    proc.wait(timeout=30)
     except KeyboardInterrupt:
         print("\nStopped watching. (Cancel the job in MAESTRO if it's still running.)")
 
-    print(f"\nDone: {len(seen)} spectra logged to {log_path}")
+    print(f"\nDone: {total} spectra logged in {DATA_ROOT}")
 
 
 if __name__ == "__main__":
